@@ -1,0 +1,8 @@
+# 1st Line is Comment: Control File Template
+2025-08-27 00:00 ! Start datetime (YYYY-MM-DD HH:mm)
+2025-09-05 00:00 ! End datetime (YYYY-MM-DD HH:mm)
+8 ! DT multiplier: DT is 3 hrs for GOFS 3.1 so 8 indicates 24 hr output
+ftp ! The server to ownload from (ftp -or- ncs -or- opd)
+3 ! Output type, = 1 for T & S attributes only, = 2 for T,S,U,V attributes
+bathyfixed.14
+bcforcing_ver6p2.nc

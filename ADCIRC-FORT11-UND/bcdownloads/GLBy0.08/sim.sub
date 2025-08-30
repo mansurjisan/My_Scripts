@@ -1,0 +1,6 @@
+#!/bin/bash
+
+module load mvapich2
+module load netcdf
+
+./OGCM_DL.a < test.inp

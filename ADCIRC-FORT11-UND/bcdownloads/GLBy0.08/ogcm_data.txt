@@ -1,0 +1,11 @@
+10
+'2025-08-27 00:00' rtofs_glo.t00z.n00.archv.20250827.nc dmy dmy
+'2025-08-28 00:00' rtofs_glo.t00z.n00.archv.20250828.nc dmy dmy
+'2025-08-29 00:00' rtofs_glo.t00z.n00.archv.20250829.nc dmy dmy
+'2025-08-30 00:00' rtofs_glo.t00z.n00.archv.20250830.nc dmy dmy
+'2025-08-31 00:00' rtofs_glo.t00z.n00.archv.20250831.nc dmy dmy
+'2025-09-01 00:00' rtofs_glo.t00z.n00.archv.20250901.nc dmy dmy
+'2025-09-02 00:00' rtofs_glo.t00z.n00.archv.20250902.nc dmy dmy
+'2025-09-03 00:00' rtofs_glo.t00z.n00.archv.20250903.nc dmy dmy
+'2025-09-04 00:00' rtofs_glo.t00z.n00.archv.20250904.nc dmy dmy
+'2025-09-05 00:00' rtofs_glo.t00z.n00.archv.20250905.nc dmy dmy
