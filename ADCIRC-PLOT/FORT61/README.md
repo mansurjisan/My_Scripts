@@ -1,0 +1,1 @@
+python extract_fort61.py --overlay fort.61.nc fort.61_yuji_new.nc --station-idx 46 --labels "UND" "Yuji_New_Data" --save-plot wilmington_comp_new.png
