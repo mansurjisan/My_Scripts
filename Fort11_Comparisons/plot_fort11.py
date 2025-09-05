@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Fixed script to plot fort.11.nc with proper color-levels support
+script to plot fort.11.nc with proper color-levels support
+python plot_fort112.py fort.11.nc MLD --mode snapshots     --vmin 0 --vmax 0.02 --color-levels 16 --colormap viridis     --max-points 0 --dpi 300
 """
 
 import numpy as np

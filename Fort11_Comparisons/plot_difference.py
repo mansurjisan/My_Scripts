@@ -2,6 +2,7 @@
 """
 Script to plot differences between two fort.11.nc (or bcforcing_ver6p2.nc) files
 Compares the same variable across two different files and visualizes the difference
+python plot_difference2.py fort.11.nc fort.11_und.nc SigTS --mode snapshots     --vmin -0.000006 --vmax 0.000007 --color-levels 16 --colormap RdBu_r     --max-points 0 --dpi 300 --no-individual --output-dir SigTS_diff_only
 """
 
 import numpy as np
