@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Enhanced script to plot single NetCDF files or differences between two files
+Script to plot single NetCDF files or differences between two files
 Supports wind speed calculation from U/V components
 """
 
