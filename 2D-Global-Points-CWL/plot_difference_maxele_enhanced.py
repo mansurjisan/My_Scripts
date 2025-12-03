@@ -26,11 +26,260 @@ from matplotlib.colors import BoundaryNorm, TwoSlopeNorm
 import warnings
 warnings.filterwarnings('ignore', message='.*XRandR.*')
 try:
+    from scipy.interpolate import griddata
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+    print("Warning: scipy not available. Grid interpolation disabled.")
+try:
     import geopandas as gpd
     GEOPANDAS_AVAILABLE = True
 except ImportError:
     GEOPANDAS_AVAILABLE = False
     print("Warning: geopandas not available. Coastlines will not be drawn.")
+
+def get_mesh_triangulation(nc_file, x, y, lon_min, lon_max, lat_min, lat_max):
+    """
+    Get triangulation from the mesh element connectivity in the NetCDF file.
+    This preserves the actual mesh structure for accurate visualization.
+    """
+    try:
+        nc = Dataset(nc_file, 'r')
+        if 'element' not in nc.variables:
+            nc.close()
+            return None
+
+        # Get element connectivity (1-based indexing in ADCIRC)
+        elements = nc.variables['element'][:] - 1  # Convert to 0-based
+
+        # Filter triangles that have all vertices within the region
+        # First, find which nodes are in the region
+        node_in_region = ((x >= lon_min) & (x <= lon_max) &
+                          (y >= lat_min) & (y <= lat_max))
+
+        # Keep triangles where all 3 vertices are in region
+        tri_mask = (node_in_region[elements[:, 0]] &
+                    node_in_region[elements[:, 1]] &
+                    node_in_region[elements[:, 2]])
+
+        filtered_elements = elements[tri_mask]
+
+        nc.close()
+
+        if len(filtered_elements) == 0:
+            return None
+
+        # Create triangulation with the mesh connectivity
+        triang = tri.Triangulation(x, y, triangles=filtered_elements)
+        return triang
+
+    except Exception as e:
+        print(f"Could not load mesh triangulation: {e}")
+        return None
+
+
+def extract_regional_mesh(nc_file, x, y, data, lon_min, lon_max, lat_min, lat_max):
+    """
+    Extract mesh subset for a specific region with remapped indices.
+    This is equivalent to NCL's sfElementNodes approach for tricontourf.
+
+    Returns a new triangulation with properly remapped indices for the regional subset,
+    avoiding issues with invalid triangle indices when using full coordinate arrays.
+
+    Parameters:
+    -----------
+    nc_file : str
+        Path to NetCDF file containing mesh connectivity
+    x, y : arrays
+        Full coordinate arrays from the mesh
+    data : array
+        Data values at each mesh point
+    lon_min, lon_max, lat_min, lat_max : float
+        Bounds of the region to extract
+
+    Returns:
+    --------
+    x_reg, y_reg : arrays
+        Regional coordinate arrays
+    elements_reg : array
+        Regional element connectivity with remapped indices (0-based)
+    data_reg : array
+        Regional data values
+    """
+    try:
+        nc = Dataset(nc_file, 'r')
+        if 'element' not in nc.variables:
+            nc.close()
+            return None, None, None, None
+
+        # Get element connectivity (1-based indexing in ADCIRC)
+        elements = nc.variables['element'][:] - 1  # Convert to 0-based
+        nc.close()
+
+        # Find triangles where ALL vertices are within the region (with small buffer)
+        buffer = 0.05
+        node_in_region = ((x >= lon_min - buffer) & (x <= lon_max + buffer) &
+                          (y >= lat_min - buffer) & (y <= lat_max + buffer))
+
+        tri_in_region = (node_in_region[elements[:, 0]] &
+                         node_in_region[elements[:, 1]] &
+                         node_in_region[elements[:, 2]])
+
+        regional_elements = elements[tri_in_region]
+
+        if len(regional_elements) == 0:
+            print("  Warning: No triangles in region!")
+            return None, None, None, None
+
+        # Get unique nodes used in regional triangles
+        unique_nodes = np.unique(regional_elements.ravel())
+
+        # Create old -> new index mapping
+        old_to_new = {old: new for new, old in enumerate(unique_nodes)}
+
+        # Extract regional coordinates and data
+        x_reg = x[unique_nodes]
+        y_reg = y[unique_nodes]
+        data_reg = data[unique_nodes]
+
+        # Remap element indices to new node indices
+        elements_reg = np.array([
+            [old_to_new[e[0]], old_to_new[e[1]], old_to_new[e[2]]]
+            for e in regional_elements
+        ])
+
+        print(f"  Regional mesh: {len(x_reg)} nodes, {len(elements_reg)} triangles")
+
+        return x_reg, y_reg, elements_reg, data_reg
+
+    except Exception as e:
+        print(f"Could not extract regional mesh: {e}")
+        return None, None, None, None
+
+
+def interpolate_to_grid(x, y, data, lon_min, lon_max, lat_min, lat_max, resolution=0.02):
+    """
+    Interpolate unstructured mesh data to a regular grid.
+
+    This removes visual bias from mesh density - areas with more mesh points
+    no longer appear more intense than areas with fewer points.
+
+    Parameters:
+    -----------
+    x, y : arrays
+        Coordinates of the unstructured mesh points
+    data : array
+        Data values at each mesh point
+    lon_min, lon_max, lat_min, lat_max : float
+        Bounds of the region to interpolate
+    resolution : float
+        Grid resolution in degrees (default 0.02 ~ 2km)
+
+    Returns:
+    --------
+    grid_lon, grid_lat : 2D arrays
+        Meshgrid of longitude and latitude
+    grid_data : 2D array
+        Interpolated data on the regular grid
+    """
+    if not SCIPY_AVAILABLE:
+        return None, None, None
+
+    # Create regular grid
+    grid_x = np.arange(lon_min, lon_max, resolution)
+    grid_y = np.arange(lat_min, lat_max, resolution)
+    grid_lon, grid_lat = np.meshgrid(grid_x, grid_y)
+
+    # Filter points within the region
+    mask = ((x >= lon_min) & (x <= lon_max) &
+            (y >= lat_min) & (y <= lat_max))
+
+    x_region = x[mask]
+    y_region = y[mask]
+    data_region = data[mask]
+
+    # Handle masked arrays
+    if hasattr(data_region, 'mask'):
+        valid_mask = ~data_region.mask
+        x_region = x_region[valid_mask]
+        y_region = y_region[valid_mask]
+        data_region = data_region[valid_mask]
+
+    if len(x_region) == 0:
+        return None, None, None
+
+    # Interpolate to regular grid using linear interpolation
+    # Do NOT fill NaN values - leave masked areas as NaN (will show as white/transparent)
+    points = np.column_stack((x_region, y_region))
+    grid_data = griddata(points, data_region, (grid_lon, grid_lat), method='linear')
+
+    return grid_lon, grid_lat, grid_data
+
+
+def interpolate_with_triangulation(nc_file, x, y, data, lon_min, lon_max, lat_min, lat_max, resolution=0.005):
+    """
+    High-quality interpolation using mesh triangulation with CubicTriInterpolator.
+
+    Uses the actual mesh connectivity for accurate interpolation that preserves
+    coastal features while providing smooth output on a regular grid.
+
+    Parameters:
+    -----------
+    nc_file : str
+        Path to NetCDF file containing mesh connectivity
+    x, y : arrays
+        Full coordinate arrays from the mesh
+    data : array
+        Data values at each mesh point
+    lon_min, lon_max, lat_min, lat_max : float
+        Bounds of the region to interpolate
+    resolution : float
+        Grid resolution in degrees (default 0.005 ~ 500m for coastal detail)
+
+    Returns:
+    --------
+    grid_lon, grid_lat : 2D arrays
+        Meshgrid of longitude and latitude
+    grid_data : 2D array
+        Interpolated data on the regular grid
+    """
+    from matplotlib.tri import LinearTriInterpolator, CubicTriInterpolator
+
+    # Get mesh triangulation
+    mesh_triang = get_mesh_triangulation(nc_file, x, y, lon_min, lon_max, lat_min, lat_max)
+    if mesh_triang is None:
+        print("Could not get mesh triangulation, falling back to scipy griddata")
+        return interpolate_to_grid(x, y, data, lon_min, lon_max, lat_min, lat_max, resolution)
+
+    # Handle masked data - replace masked values with NaN for interpolation
+    data_clean = np.array(data, dtype=float)
+    if hasattr(data, 'mask'):
+        data_clean[data.mask] = np.nan
+
+    # Create regular grid
+    grid_x = np.arange(lon_min, lon_max, resolution)
+    grid_y = np.arange(lat_min, lat_max, resolution)
+    grid_lon, grid_lat = np.meshgrid(grid_x, grid_y)
+
+    print(f"Interpolating to {len(grid_x)}x{len(grid_y)} grid (resolution: {resolution}°)")
+
+    try:
+        # Try cubic interpolation first for smoothest results
+        interpolator = CubicTriInterpolator(mesh_triang, data_clean, kind='geom')
+        grid_data = interpolator(grid_lon, grid_lat)
+        print("Using CubicTriInterpolator (geometric)")
+    except Exception as e:
+        print(f"Cubic interpolation failed ({e}), trying linear...")
+        try:
+            interpolator = LinearTriInterpolator(mesh_triang, data_clean)
+            grid_data = interpolator(grid_lon, grid_lat)
+            print("Using LinearTriInterpolator")
+        except Exception as e2:
+            print(f"Linear interpolation also failed ({e2}), falling back to scipy")
+            return interpolate_to_grid(x, y, data, lon_min, lon_max, lat_min, lat_max, resolution)
+
+    return grid_lon, grid_lat, grid_data
+
 
 def load_netcdf_data(filename):
     """Load data from NetCDF file"""
@@ -65,19 +314,19 @@ def is_spatial_only_variable(nc, var_name):
 
 def compute_spatial_difference(nc1, nc2, var_name):
     """Compute difference between two datasets for spatial-only variables like zeta_max"""
-    
+
     # Get coordinates from both files
     x1 = nc1.variables['x'][:]
     y1 = nc1.variables['y'][:]
     x2 = nc2.variables['x'][:]
     y2 = nc2.variables['y'][:]
-    
+
     # Check if grids match
     if len(x1) != len(x2) or len(y1) != len(y2):
         print(f"Warning: Grid sizes don't match!")
         print(f"  File 1: {len(x1)} nodes")
         print(f"  File 2: {len(x2)} nodes")
-        
+
         # Use the smaller grid as reference
         if len(x1) <= len(x2):
             x_ref, y_ref = x1, y1
@@ -87,44 +336,59 @@ def compute_spatial_difference(nc1, nc2, var_name):
             print(f"  Using File 2 grid as reference")
     else:
         x_ref, y_ref = x1, y1
-    
+
     # Get variable data
     var_data1 = nc1.variables[var_name]
     var_data2 = nc2.variables[var_name]
-    
+
     # Get data (no time dimension for spatial-only variables)
     data1 = var_data1[:]
     data2 = var_data2[:]
-    
-    # Handle fill values
-    if hasattr(var_data1, '_FillValue'):
-        data1 = np.ma.masked_equal(data1, var_data1._FillValue)
-    if hasattr(var_data2, '_FillValue'):
-        data2 = np.ma.masked_equal(data2, var_data2._FillValue)
-    
+
+    # Handle fill values - mask them properly
+    # Check for _FillValue attribute
+    fill_val1 = getattr(var_data1, '_FillValue', None)
+    fill_val2 = getattr(var_data2, '_FillValue', None)
+
+    if fill_val1 is not None:
+        data1 = np.ma.masked_equal(data1, fill_val1)
+    if fill_val2 is not None:
+        data2 = np.ma.masked_equal(data2, fill_val2)
+
+    # Also mask any values that look like fill values (< -90000 or > 90000)
+    # This catches cases where fill value attribute is missing
+    data1 = np.ma.masked_where(np.abs(data1) > 90000, data1)
+    data2 = np.ma.masked_where(np.abs(data2) > 90000, data2)
+
+    print(f"  After masking fill values:")
+    print(f"    File 1 masked points: {np.sum(data1.mask) if hasattr(data1, 'mask') else 0}")
+    print(f"    File 2 masked points: {np.sum(data2.mask) if hasattr(data2, 'mask') else 0}")
+
     # Compute difference (ensure same size)
     min_len = min(len(data1), len(data2))
     data1 = data1[:min_len]
     data2 = data2[:min_len]
     x_ref = x_ref[:min_len]
     y_ref = y_ref[:min_len]
-    
-    # Calculate difference
+
+    # Calculate difference - masked values propagate automatically
     diff_data = data2 - data1  # File2 - File1
-    
+
     return x_ref, y_ref, diff_data, data1, data2, var_data1
 
 def plot_zeta_max_difference(x, y, diff_data, data1, data2, var_name, var_info,
-                            file1_name, file2_name, output_file=None, 
-                            region='north_atlantic', lon_range=None, lat_range=None, 
-                            max_points=100000, colormap='RdBu_r', point_size=0.5, 
+                            file1_name, file2_name, output_file=None,
+                            region='north_atlantic', lon_range=None, lat_range=None,
+                            max_points=100000, colormap='RdBu_r', point_size=0.5,
                             dpi=150, use_triangulation=False, vmin=None, vmax=None,
                             color_levels=None, symmetric=True, figsize=(18, 12),
                             show_individual=True, show_percentage=False,
                             highlight_extremes=False, save_individual_panels=False,
-                            location_name=''):
+                            location_name='', use_grid=False, grid_resolution=0.02,
+                            use_mesh=False, use_mesh_interp=False, use_tricontourf=False):
     """Create difference plot for spatial-only variables like zeta_max"""
-    
+    import math
+
     # Define regional bounds
     if region == 'north_atlantic':
         lon_min, lon_max = -80, 20
@@ -266,7 +530,7 @@ def plot_zeta_max_difference(x, y, diff_data, data1, data2, var_name, var_info,
                  f"File 2: {os.path.basename(file2_name)}", 
                  f"{'Percentage Difference' if show_percentage else 'Difference'} (File 2 - File 1)"]
         cmaps = ['viridis', 'viridis', colormap]
-        
+
     else:
         fig, ax3 = plt.subplots(figsize=figsize, dpi=dpi)
         axes = [ax3]
@@ -276,16 +540,19 @@ def plot_zeta_max_difference(x, y, diff_data, data1, data2, var_name, var_info,
         else:
             titles = [f"Difference: {os.path.basename(file2_name)} - {os.path.basename(file1_name)}"]
         cmaps = [colormap]
-    
+
     # Get variable metadata
     long_name = getattr(var_info, 'long_name', var_name)
     units = getattr(var_info, 'units', '')
-    
+    # Default units for common variables if not specified
+    if not units and var_name in ['zeta_max', 'zeta', 'elevation', 'water_level']:
+        units = 'm'
+
     # Plot each subplot
     individual_figs = []  # Store individual figures if needed
-    
+
     for idx, (ax, data, title, cmap) in enumerate(zip(axes, data_list, titles, cmaps)):
-        
+
         # Create individual figure if requested
         if save_individual_panels:
             fig_ind = plt.figure(figsize=(10, 8), dpi=dpi)
@@ -318,10 +585,164 @@ def plot_zeta_max_difference(x, y, diff_data, data1, data2, var_name, var_info,
         axes_to_plot = [ax]
         if save_individual_panels:
             axes_to_plot.append(ax_ind)
-        
+
         for ax_current in axes_to_plot:
-            # Plot data
-            if use_triangulation and len(x_region) < 1000000:
+            # Plot data - use mesh-based interpolation if requested
+            if use_mesh_interp:
+                # High-quality interpolation using mesh triangulation
+                # Use the appropriate data array based on which plot we're making
+                if idx < 2 and show_individual:
+                    full_data = data1 if idx == 0 else data2
+                else:
+                    full_data = diff_data
+
+                grid_lon, grid_lat, grid_data = interpolate_with_triangulation(
+                    file1_name, x, y, full_data,
+                    lon_min, lon_max, lat_min, lat_max,
+                    resolution=grid_resolution
+                )
+                if grid_lon is not None:
+                    if norm is not None:
+                        im = ax_current.pcolormesh(grid_lon, grid_lat, grid_data,
+                                         cmap=cmap, norm=norm, shading='auto',
+                                         rasterized=True)
+                    else:
+                        im = ax_current.pcolormesh(grid_lon, grid_lat, grid_data,
+                                         cmap=cmap, vmin=vmin_use, vmax=vmax_use,
+                                         shading='auto', rasterized=True)
+                else:
+                    # Fallback to scatter if interpolation fails
+                    print("Mesh interpolation failed, falling back to scatter")
+                    if norm is not None:
+                        im = ax_current.scatter(x_region, y_region, c=data,
+                                       cmap=cmap, s=point_size, alpha=0.8,
+                                       edgecolors='none', rasterized=True, norm=norm)
+                    else:
+                        im = ax_current.scatter(x_region, y_region, c=data,
+                                       cmap=cmap, s=point_size, alpha=0.8,
+                                       edgecolors='none', rasterized=True,
+                                       vmin=vmin_use, vmax=vmax_use)
+            elif use_mesh:
+                # Use actual mesh triangulation from NetCDF file with tripcolor
+                # This preserves coastal detail while using proper mesh structure
+                # Need to use FULL arrays (x, y) for mesh, and appropriate data
+                # For difference plot (idx==2 or not show_individual), use plot_data
+                # For individual plots, use the original data arrays
+                if idx < 2 and show_individual:
+                    full_data = data1 if idx == 0 else data2
+                else:
+                    full_data = plot_data if not show_individual else diff_region
+                    # For diff, need the full diff_data array
+                    full_data = diff_data if (idx == 2 or not show_individual) else (data1 if idx == 0 else data2)
+
+                mesh_triang = get_mesh_triangulation(file1_name, x, y,
+                                                     lon_min, lon_max, lat_min, lat_max)
+                if mesh_triang is not None:
+                    # Use tripcolor with gouraud shading for smooth appearance
+                    if norm is not None:
+                        im = ax_current.tripcolor(mesh_triang, full_data, cmap=cmap,
+                                                  norm=norm, shading='gouraud',
+                                                  rasterized=True)
+                    else:
+                        im = ax_current.tripcolor(mesh_triang, full_data, cmap=cmap,
+                                                  vmin=vmin_use, vmax=vmax_use,
+                                                  shading='gouraud', rasterized=True)
+                else:
+                    # Fallback to scatter if mesh triangulation fails
+                    print("Mesh triangulation failed, falling back to scatter")
+                    if norm is not None:
+                        im = ax_current.scatter(x_region, y_region, c=data,
+                                       cmap=cmap, s=point_size, alpha=0.8,
+                                       edgecolors='none', rasterized=True, norm=norm)
+                    else:
+                        im = ax_current.scatter(x_region, y_region, c=data,
+                                       cmap=cmap, s=point_size, alpha=0.8,
+                                       edgecolors='none', rasterized=True,
+                                       vmin=vmin_use, vmax=vmax_use)
+            elif use_tricontourf:
+                # Use tricontourf with actual mesh connectivity (NCL-style trimesh)
+                # This produces the best quality by using the actual mesh triangles
+                # and avoiding artifacts from Delaunay triangulation or interpolation
+                if idx < 2 and show_individual:
+                    full_data = data1 if idx == 0 else data2
+                else:
+                    full_data = diff_data
+
+                # Extract regional mesh with remapped indices
+                x_reg, y_reg, elem_reg, data_reg = extract_regional_mesh(
+                    file1_name, x, y, full_data,
+                    lon_min, lon_max, lat_min, lat_max
+                )
+
+                if elem_reg is not None:
+                    # Create triangulation with regional mesh
+                    triang_reg = tri.Triangulation(x_reg, y_reg, triangles=elem_reg)
+
+                    # Handle NaN values and extreme outliers - tricontourf cannot handle NaN
+                    # Also mask triangles with extreme values that create artificial artifacts
+                    mask_nan = np.isnan(data_reg)
+
+                    # Define outlier threshold - values beyond ±1.5m are likely artifacts
+                    # These extreme values in coastal bays are unrealistic for bias correction
+                    outlier_threshold = 1.5
+                    mask_outlier = np.abs(data_reg) > outlier_threshold
+
+                    # Combined mask for NaN and outliers
+                    mask_bad = mask_nan | mask_outlier
+
+                    # Mask triangles where any vertex has NaN or outlier value
+                    tri_has_bad = mask_bad[triang_reg.triangles].any(axis=1)
+                    triang_reg.set_mask(tri_has_bad)
+
+                    # Replace bad values with 0 (they will be masked anyway)
+                    data_reg_clean = np.where(mask_bad, 0, data_reg)
+
+                    # Create levels for contourf
+                    n_levels = 41  # Number of contour levels
+                    levels = np.linspace(vmin_use, vmax_use, n_levels)
+
+                    im = ax_current.tricontourf(triang_reg, data_reg_clean, levels=levels,
+                                     cmap=cmap, extend='both')
+                else:
+                    # Fallback to scatter if mesh extraction fails
+                    print("Tricontourf mesh extraction failed, falling back to scatter")
+                    if norm is not None:
+                        im = ax_current.scatter(x_region, y_region, c=data,
+                                       cmap=cmap, s=point_size, alpha=0.8,
+                                       edgecolors='none', rasterized=True, norm=norm)
+                    else:
+                        im = ax_current.scatter(x_region, y_region, c=data,
+                                       cmap=cmap, s=point_size, alpha=0.8,
+                                       edgecolors='none', rasterized=True,
+                                       vmin=vmin_use, vmax=vmax_use)
+            elif use_grid and SCIPY_AVAILABLE:
+                # Interpolate to regular grid to remove mesh density bias
+                grid_lon, grid_lat, grid_data = interpolate_to_grid(
+                    x_region, y_region, data,
+                    lon_min, lon_max, lat_min, lat_max,
+                    resolution=grid_resolution
+                )
+                if grid_lon is not None:
+                    if norm is not None:
+                        im = ax_current.pcolormesh(grid_lon, grid_lat, grid_data,
+                                         cmap=cmap, norm=norm, shading='auto',
+                                         rasterized=True)
+                    else:
+                        im = ax_current.pcolormesh(grid_lon, grid_lat, grid_data,
+                                         cmap=cmap, vmin=vmin_use, vmax=vmax_use,
+                                         shading='auto', rasterized=True)
+                else:
+                    # Fallback to scatter if interpolation fails
+                    if norm is not None:
+                        im = ax_current.scatter(x_region, y_region, c=data,
+                                       cmap=cmap, s=point_size, alpha=0.8,
+                                       edgecolors='none', rasterized=True, norm=norm)
+                    else:
+                        im = ax_current.scatter(x_region, y_region, c=data,
+                                       cmap=cmap, s=point_size, alpha=0.8,
+                                       edgecolors='none', rasterized=True,
+                                       vmin=vmin_use, vmax=vmax_use)
+            elif use_triangulation and len(x_region) < 1000000:
                 triang = tri.Triangulation(x_region, y_region)
                 # Use tricontourf for smoother filled contours
                 if norm is not None:
@@ -346,7 +767,7 @@ def plot_zeta_max_difference(x, y, diff_data, data1, data2, var_name, var_info,
                                    cmap=cmap, s=point_size, alpha=0.8,
                                    edgecolors='none', rasterized=True,
                                    vmin=vmin_use, vmax=vmax_use)
-            
+
             # Add extreme points markers if requested
             if highlight_extremes and 'idx_min' in locals():
                 if idx < 2 and show_individual:
@@ -371,10 +792,13 @@ def plot_zeta_max_difference(x, y, diff_data, data1, data2, var_name, var_info,
                                 label=f'Min diff: {val_min:.3f}')
                     ax_current.legend(loc='upper right', fontsize=9)
             
-            # Colorbar
-            cbar = plt.colorbar(im, ax=ax_current, shrink=1.0, pad=0.02)
+            # Colorbar - use make_axes_locatable to match plot height
+            from mpl_toolkits.axes_grid1 import make_axes_locatable
+            divider = make_axes_locatable(ax_current)
+            cax = divider.append_axes("right", size="3%", pad=0.1)
+            cbar = plt.colorbar(im, cax=cax)
             cbar.ax.tick_params(labelsize=12)
-            
+
             # Labels
             ax_current.set_xlabel('Longitude (degrees)', fontsize=14)
             ax_current.set_ylabel('Latitude (degrees)', fontsize=14)
@@ -417,15 +841,15 @@ def plot_zeta_max_difference(x, y, diff_data, data1, data2, var_name, var_info,
             ax_current.set_aspect('equal')
             ax_current.grid(True, alpha=0.2, linewidth=0.5)
 
-            # Add high-resolution coastline
+            # Add high-resolution coastline with land fill
             if GEOPANDAS_AVAILABLE:
                 try:
                     from shapely.geometry import box
 
                     # Determine appropriate GSHHS resolution based on region size
-                    lon_range = lon_max - lon_min
-                    lat_range = lat_max - lat_min
-                    region_size = max(lon_range, lat_range)
+                    lon_range_size = lon_max - lon_min
+                    lat_range_size = lat_max - lat_min
+                    region_size = max(lon_range_size, lat_range_size)
 
                     # Select resolution: full (f) for small regions, high (h) for larger
                     if region_size < 5:  # Small region like Chesapeake Bay
@@ -448,21 +872,21 @@ def plot_zeta_max_difference(x, y, diff_data, data1, data2, var_name, var_info,
                             # Fix invalid geometries before clipping
                             coastline['geometry'] = coastline.buffer(0)
                             coastline_clipped = coastline.clip(bbox)
-                            # Plot coastline
-                            coastline_clipped.boundary.plot(ax=ax_current, edgecolor='black',
-                                                            linewidth=linewidth, zorder=10)
+                            # Fill land with light gray color and add coastline boundary
+                            coastline_clipped.plot(ax=ax_current, facecolor='lightgray',
+                                                   edgecolor='black', linewidth=linewidth, zorder=5)
                         except Exception as e:
                             print(f"Clipping error, plotting full coastline: {e}")
                             # Plot without clipping if clipping fails
-                            coastline.boundary.plot(ax=ax_current, edgecolor='black',
-                                                    linewidth=linewidth, zorder=10)
+                            coastline.plot(ax=ax_current, facecolor='lightgray',
+                                           edgecolor='black', linewidth=linewidth, zorder=5)
                     # Fallback to Natural Earth data
                     elif os.path.exists('ne_10m_land.shp'):
                         land = gpd.read_file('ne_10m_land.shp')
                         bbox = box(lon_min, lat_min, lon_max, lat_max)
                         land_clipped = land.clip(bbox)
-                        land_clipped.boundary.plot(ax=ax_current, edgecolor='black',
-                                                   linewidth=1.0, zorder=10)
+                        land_clipped.plot(ax=ax_current, facecolor='lightgray',
+                                          edgecolor='black', linewidth=1.0, zorder=5)
                     elif os.path.exists('ne_10m_coastline.shp'):
                         world = gpd.read_file('ne_10m_coastline.shp')
                         world.plot(ax=ax_current, edgecolor='black', linewidth=0.8, zorder=10)
@@ -476,22 +900,36 @@ def plot_zeta_max_difference(x, y, diff_data, data1, data2, var_name, var_info,
                 ax_current.axhline(y=0, color='gray', linestyle='-', alpha=0.3, linewidth=0.5)
                 ax_current.axvline(x=0, color='gray', linestyle='-', alpha=0.3, linewidth=0.5)
 
-            # Add forecast time from filename (extract from t00z, t06z, etc.)
+            # Add forecast time from NetCDF attribute or filename
             if (idx == 2 or not show_individual) and ax_current == ax:  # Only add to main difference plot
                 import re
                 from datetime import datetime
-                # Try to extract date and time from filename
-                filename = os.path.basename(file1_name)
-                time_match = re.search(r't(\d{2})z', filename)
-                # Get absolute path and search for date in directory
-                abs_path = os.path.abspath(file1_name)
-                date_match = re.search(r'(\d{8})', abs_path)
+                time_str = ""
 
-                if time_match or date_match:
-                    time_str = ""
+                # First try to get date from NetCDF file attributes (rundes)
+                try:
+                    from netCDF4 import Dataset
+                    with Dataset(file1_name, 'r') as nc_check:
+                        if hasattr(nc_check, 'rundes'):
+                            rundes = nc_check.rundes
+                            # Extract YYYYMMDDHH from rundes (e.g., "2025112200 :-6 hr nowcast...")
+                            rundes_match = re.search(r'(\d{10})', rundes)
+                            if rundes_match:
+                                date_str = rundes_match.group(1)
+                                date_obj = datetime.strptime(date_str, '%Y%m%d%H')
+                                time_str = f"Forecast: {date_obj.strftime('%Y-%m-%d %H:%M')} UTC"
+                except:
+                    pass
+
+                # Fallback: extract from filename/path
+                if not time_str:
+                    filename = os.path.basename(file1_name)
+                    time_match = re.search(r't(\d{2})z', filename)
+                    abs_path = os.path.abspath(file1_name)
+                    date_match = re.search(r'(\d{8})', abs_path)
+
                     if date_match:
                         date_str = date_match.group(1)
-                        # Parse date for forecast time (no subtraction)
                         date_obj = datetime.strptime(date_str, '%Y%m%d')
                         formatted_date = date_obj.strftime('%Y-%m-%d')
                         time_str = f"Forecast: {formatted_date}"
@@ -502,11 +940,12 @@ def plot_zeta_max_difference(x, y, diff_data, data1, data2, var_name, var_info,
                         else:
                             time_str = f"Forecast: {hour}:00 UTC"
 
-                    if time_str:
-                        ax_current.text(0.02, 0.98, time_str, transform=ax_current.transAxes,
-                               fontsize=12, verticalalignment='top', horizontalalignment='left',
-                               bbox=dict(boxstyle='round,pad=0.5', facecolor='white',
-                                        edgecolor='gray', linewidth=1, alpha=0.9))
+                if time_str:
+                    ax_current.text(0.02, 0.98, time_str, transform=ax_current.transAxes,
+                           fontsize=12, verticalalignment='top', horizontalalignment='left',
+                           bbox=dict(boxstyle='round,pad=0.5', facecolor='white',
+                                    edgecolor='gray', linewidth=1, alpha=0.9),
+                           zorder=20)
     
     # Title
     if show_individual:
@@ -623,14 +1062,14 @@ def compute_difference(nc1, nc2, var_name, time_index):
 
 def plot_difference(x, y, diff_data, data1, data2, var_name, var_info,
                    time_str1, time_str2, file1_name, file2_name,
-                   output_file=None, region='north_atlantic', 
+                   output_file=None, region='north_atlantic',
                    lon_range=None, lat_range=None, max_points=100000,
                    colormap='RdBu_r', point_size=0.5, dpi=150,
                    use_triangulation=False, vmin=None, vmax=None,
                    color_levels=None, symmetric=True, figsize=(18, 12),
                    show_individual=True, show_percentage=False,
                    highlight_extremes=False, save_individual_panels=False,
-                   location_name=''):
+                   location_name='', use_grid=False, grid_resolution=0.02):
     """Create difference plot with optional individual plots"""
     
     # Define regional bounds
@@ -768,7 +1207,7 @@ def plot_difference(x, y, diff_data, data1, data2, var_name, var_info,
                  f"File 2: {os.path.basename(file2_name)}", 
                  f"{'Percentage Difference' if show_percentage else 'Difference'} (File 2 - File 1)"]
         cmaps = ['viridis', 'viridis', colormap]
-        
+
     else:
         fig, ax3 = plt.subplots(figsize=figsize, dpi=dpi)
         axes = [ax3]
@@ -778,16 +1217,19 @@ def plot_difference(x, y, diff_data, data1, data2, var_name, var_info,
         else:
             titles = [f"Difference: {os.path.basename(file2_name)} - {os.path.basename(file1_name)}"]
         cmaps = [colormap]
-    
+
     # Get variable metadata
     long_name = getattr(var_info, 'long_name', var_name)
     units = getattr(var_info, 'units', '')
-    
+    # Default units for common variables if not specified
+    if not units and var_name in ['zeta_max', 'zeta', 'elevation', 'water_level']:
+        units = 'm'
+
     # Plot each subplot
     individual_figs = []  # Store individual figures if needed
-    
+
     for idx, (ax, data, title, cmap) in enumerate(zip(axes, data_list, titles, cmaps)):
-        
+
         # Create individual figure if requested
         if save_individual_panels:
             fig_ind = plt.figure(figsize=(10, 8), dpi=dpi)
@@ -821,10 +1263,37 @@ def plot_difference(x, y, diff_data, data1, data2, var_name, var_info,
         axes_to_plot = [ax]
         if save_individual_panels:
             axes_to_plot.append(ax_ind)
-        
+
         for ax_current in axes_to_plot:
-            # Plot data
-            if use_triangulation and len(x_region) < 1000000:
+            # Plot data - use grid interpolation if requested
+            if use_grid and SCIPY_AVAILABLE:
+                # Interpolate to regular grid to remove mesh density bias
+                grid_lon, grid_lat, grid_data = interpolate_to_grid(
+                    x_region, y_region, data,
+                    lon_min, lon_max, lat_min, lat_max,
+                    resolution=grid_resolution
+                )
+                if grid_lon is not None:
+                    if norm is not None:
+                        im = ax_current.pcolormesh(grid_lon, grid_lat, grid_data,
+                                         cmap=cmap, norm=norm, shading='auto',
+                                         rasterized=True)
+                    else:
+                        im = ax_current.pcolormesh(grid_lon, grid_lat, grid_data,
+                                         cmap=cmap, vmin=vmin_use, vmax=vmax_use,
+                                         shading='auto', rasterized=True)
+                else:
+                    # Fallback to scatter if interpolation fails
+                    if norm is not None:
+                        im = ax_current.scatter(x_region, y_region, c=data,
+                                       cmap=cmap, s=point_size, alpha=0.8,
+                                       edgecolors='none', rasterized=True, norm=norm)
+                    else:
+                        im = ax_current.scatter(x_region, y_region, c=data,
+                                       cmap=cmap, s=point_size, alpha=0.8,
+                                       edgecolors='none', rasterized=True,
+                                       vmin=vmin_use, vmax=vmax_use)
+            elif use_triangulation and len(x_region) < 1000000:
                 triang = tri.Triangulation(x_region, y_region)
                 # Use tricontourf for smoother filled contours
                 if norm is not None:
@@ -849,7 +1318,7 @@ def plot_difference(x, y, diff_data, data1, data2, var_name, var_info,
                                    cmap=cmap, s=point_size, alpha=0.8,
                                    edgecolors='none', rasterized=True,
                                    vmin=vmin_use, vmax=vmax_use)
-            
+
             # Add extreme points markers if requested
             if highlight_extremes and 'idx_min' in locals() and idx == len(axes) - 1:
                 # Only add to difference plot
@@ -861,10 +1330,13 @@ def plot_difference(x, y, diff_data, data1, data2, var_name, var_info,
                             label=f'Min diff: {val_min:.3f}')
                 ax_current.legend(loc='upper right', fontsize=9)
             
-            # Colorbar
-            cbar = plt.colorbar(im, ax=ax_current, shrink=1.0, pad=0.02)
+            # Colorbar - use make_axes_locatable to match plot height
+            from mpl_toolkits.axes_grid1 import make_axes_locatable
+            divider = make_axes_locatable(ax_current)
+            cax = divider.append_axes("right", size="3%", pad=0.1)
+            cbar = plt.colorbar(im, cax=cax)
             cbar.ax.tick_params(labelsize=12)
-            
+
             # Labels
             ax_current.set_xlabel('Longitude (degrees)', fontsize=14)
             ax_current.set_ylabel('Latitude (degrees)', fontsize=14)
@@ -908,15 +1380,15 @@ def plot_difference(x, y, diff_data, data1, data2, var_name, var_info,
             ax_current.set_aspect('equal')
             ax_current.grid(True, alpha=0.2, linewidth=0.5)
 
-            # Add high-resolution coastline
+            # Add high-resolution coastline with land fill
             if GEOPANDAS_AVAILABLE:
                 try:
                     from shapely.geometry import box
 
                     # Determine appropriate GSHHS resolution based on region size
-                    lon_range = lon_max - lon_min
-                    lat_range = lat_max - lat_min
-                    region_size = max(lon_range, lat_range)
+                    lon_range_size = lon_max - lon_min
+                    lat_range_size = lat_max - lat_min
+                    region_size = max(lon_range_size, lat_range_size)
 
                     # Select resolution: full (f) for small regions, high (h) for larger
                     if region_size < 5:  # Small region like Chesapeake Bay
@@ -939,21 +1411,21 @@ def plot_difference(x, y, diff_data, data1, data2, var_name, var_info,
                             # Fix invalid geometries before clipping
                             coastline['geometry'] = coastline.buffer(0)
                             coastline_clipped = coastline.clip(bbox)
-                            # Plot coastline
-                            coastline_clipped.boundary.plot(ax=ax_current, edgecolor='black',
-                                                            linewidth=linewidth, zorder=10)
+                            # Fill land with light gray color and add coastline boundary
+                            coastline_clipped.plot(ax=ax_current, facecolor='lightgray',
+                                                   edgecolor='black', linewidth=linewidth, zorder=5)
                         except Exception as e:
                             print(f"Clipping error, plotting full coastline: {e}")
                             # Plot without clipping if clipping fails
-                            coastline.boundary.plot(ax=ax_current, edgecolor='black',
-                                                    linewidth=linewidth, zorder=10)
+                            coastline.plot(ax=ax_current, facecolor='lightgray',
+                                           edgecolor='black', linewidth=linewidth, zorder=5)
                     # Fallback to Natural Earth data
                     elif os.path.exists('ne_10m_land.shp'):
                         land = gpd.read_file('ne_10m_land.shp')
                         bbox = box(lon_min, lat_min, lon_max, lat_max)
                         land_clipped = land.clip(bbox)
-                        land_clipped.boundary.plot(ax=ax_current, edgecolor='black',
-                                                   linewidth=1.0, zorder=10)
+                        land_clipped.plot(ax=ax_current, facecolor='lightgray',
+                                          edgecolor='black', linewidth=1.0, zorder=5)
                     elif os.path.exists('ne_10m_coastline.shp'):
                         world = gpd.read_file('ne_10m_coastline.shp')
                         world.plot(ax=ax_current, edgecolor='black', linewidth=0.8, zorder=10)
@@ -1185,6 +1657,24 @@ def main():
                        help='Highlight locations of min/max differences')
     parser.add_argument('--save-panels', action='store_true',
                        help='Save each panel as a separate image file')
+
+    # Grid interpolation option
+    parser.add_argument('--use-grid', action='store_true',
+                       help='Interpolate to regular grid (removes mesh density visual bias)')
+    parser.add_argument('--grid-resolution', type=float, default=0.02,
+                       help='Grid resolution in degrees for interpolation (default: 0.02)')
+
+    # Mesh-based triangulation option
+    parser.add_argument('--use-mesh', action='store_true',
+                       help='Use actual mesh triangulation from NetCDF for tripcolor (preserves coastal detail)')
+
+    # High-quality mesh-based interpolation
+    parser.add_argument('--use-mesh-interp', action='store_true',
+                       help='Use mesh triangulation with CubicTriInterpolator for high-quality regridding')
+
+    # Tricontourf with actual mesh connectivity (NCL-style trimesh)
+    parser.add_argument('--use-tricontourf', action='store_true',
+                       help='Use tricontourf with actual mesh connectivity (NCL-style trimesh, best quality)')
     
     # Utility options
     parser.add_argument('-l', '--list', action='store_true',
@@ -1250,7 +1740,12 @@ def main():
         'show_percentage': args.percentage,
         'highlight_extremes': args.highlight_extremes,
         'save_individual_panels': args.save_panels,
-        'location_name': args.location_name
+        'location_name': args.location_name,
+        'use_grid': args.use_grid,
+        'grid_resolution': args.grid_resolution,
+        'use_mesh': args.use_mesh,
+        'use_mesh_interp': args.use_mesh_interp,
+        'use_tricontourf': args.use_tricontourf
     }
     
     # Execute based on mode
