@@ -66,22 +66,6 @@ Grays-Reef-Coastwatch/
     └── ... (raw data files)
 ```
 
-## Data Summary Statistics
-
-### SST (2003-2024)
-- Mean: 21.5°C
-- Range: 12.3 - 29.8°C
-- Trend: +0.028°C/year
-
-### Chlorophyll-a (2012-2024)
-- Mean: 1.8 mg/m³
-- Range: 0.49 - 8.86 mg/m³
-- Peak: Spring (March-May)
-
-### K490 Turbidity (2003-2024)
-- Mean: 0.12 m⁻¹
-- Range: 0.075 - 0.59 m⁻¹
-
 ## References
 
 - NOAA CoastWatch: https://coastwatch.noaa.gov/
