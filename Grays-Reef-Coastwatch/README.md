@@ -22,7 +22,7 @@ All data are downloaded from NOAA CoastWatch ERDDAP servers:
 
 ## Data Files
 
-### Time Series (Recommended for Analysis)
+### Time Series
 
 These files contain **spatially-averaged monthly values** - one row per month:
 
