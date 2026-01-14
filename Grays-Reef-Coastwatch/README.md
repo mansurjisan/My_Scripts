@@ -53,32 +53,6 @@ These files contain the **original gridded data** - multiple lat/lon points per 
 | `chlor_a` | mg/m³ | Chlorophyll-a concentration (proxy for phytoplankton) |
 | `kd_490` | m⁻¹ | Diffuse attenuation coefficient at 490nm (water clarity/turbidity) |
 
-## Quick Start (R)
-
-```r
-# Load time series data
-sst <- read.csv("data/sst_timeseries.csv")
-chlor_viirs <- read.csv("data/chlorophyll_timeseries.csv")
-chlor_modis <- read.csv("data/chlorophyll_modis_timeseries.csv")
-k490 <- read.csv("data/k490_modis_timeseries.csv")
-
-# Convert time column to Date
-sst$time <- as.Date(sst$time)
-chlor_viirs$time <- as.Date(chlor_viirs$time)
-chlor_modis$time <- as.Date(chlor_modis$time)
-k490$time <- as.Date(k490$time)
-
-# Plot SST (37 years: 1989-2025)
-plot(sst$time, sst$sea_surface_temperature, type="l",
-     xlab="Date", ylab="SST (°C)",
-     main="Gray's Reef NMS - Sea Surface Temperature (1989-2025)")
-
-# Plot Chlorophyll (MODIS: 2003-2019)
-plot(chlor_modis$time, chlor_modis$chlor_a, type="l", col="green",
-     xlab="Date", ylab="Chlorophyll-a (mg/m³)",
-     main="Gray's Reef NMS - Chlorophyll-a (MODIS, 2003-2019)")
-```
-
 ## Files in This Repository
 
 ```
