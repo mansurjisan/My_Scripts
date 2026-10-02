@@ -2,6 +2,7 @@
 """Compare nos-utils TEM_nu/SAL_nu phase files with the ops temnu/salnu at the same absolute times.
 
 usage: compare_nudge.py OPS.nc:YYYYMMDDHH OURS.nc:YYYYMMDDHH [OURS2.nc:YYYYMMDDHH ...] [--step 216000]
+                        [--include-buffer]
 
 YYYYMMDDHH is the absolute time of each file's time=0 (ops: the nowcast start, cycle - 24 h;
 ours: the phase start, so the forecast file starts at the cycle).
@@ -14,6 +15,10 @@ interpolation). Our files must carry the same field when run with step_nu_tr = 2
 
 Records are streamed one at a time (the ops files are ~745 MB). Nodes are matched on
 map_to_global_node. Statistics per file and per level third: max |diff|, RMS, equal count.
+
+The last record of each of our phase files is a buffer SCHISM never reads (it reads up to the
+run end); nos-utils holds the last needed value there. It is reported on its own line and left out
+of the statistics unless --include-buffer is given.
 """
 import sys
 from datetime import datetime
@@ -64,6 +69,9 @@ class Acc:
 
 def main(argv):
     step = 216000.0
+    include_buffer = "--include-buffer" in argv
+    if include_buffer:
+        argv.remove("--include-buffer")
     if "--step" in argv:
         i = argv.index("--step")
         step = float(argv[i + 1])
@@ -119,6 +127,12 @@ def main(argv):
                     a, b = ops_record(n, ioo), ops_record(n + 1, ioo)
                     want = (a.astype(np.float64) * (1.0 - f) + b.astype(np.float64) * f).astype(F32)
                 d = record(ds, j, io) - want
+                if j == len(tt) - 1 and not include_buffer:
+                    ok = np.isfinite(d)
+                    mx = float(np.abs(d[ok]).max()) if ok.any() else float("nan")
+                    print(f"  record {j} (tau {tau:.0f} s) is the buffer record SCHISM never reads: "
+                          f"max|d| {mx:.4g}; not in the statistics")
+                    continue
                 total.add(d)
                 for acc, idx in zip(by_third, thirds):
                     acc.add(d[:, idx])
