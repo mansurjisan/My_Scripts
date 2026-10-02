@@ -42,12 +42,14 @@ def record(ds, k, sel):
 
 class Acc:
     def __init__(self):
-        self.n = self.eq = 0
+        self.n = self.eq = self.nonfinite = 0
         self.ss = 0.0
         self.mx = 0.0
 
     def add(self, d):
-        d = d[np.isfinite(d)].astype(np.float64)
+        ok = np.isfinite(d)
+        self.nonfinite += int(d.size - ok.sum())
+        d = d[ok].astype(np.float64)
         self.n += d.size
         self.eq += int((d == 0).sum())
         self.ss += float((d * d).sum())
@@ -56,7 +58,8 @@ class Acc:
 
     def text(self):
         rms = (self.ss / self.n) ** 0.5 if self.n else float("nan")
-        return f"n={self.n} equal={self.eq} RMS {rms:.4g} max|d| {self.mx:.4g}"
+        return (f"n={self.n} equal={self.eq} RMS {rms:.4g} max|d| {self.mx:.4g}"
+                f" non-finite differences {self.nonfinite}")
 
 
 def main(argv):
